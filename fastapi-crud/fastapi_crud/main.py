@@ -1,21 +1,47 @@
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.orm import Session
-from . import models, schemas
-from .database import SessionLocal, engine
+from fastapi import FastAPI, HTTPException
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field
+from bson import ObjectId
+import os
 
-# DB初期化（テーブルが無ければ作成）
-models.Base.metadata.create_all(bind=engine)
+# ---------------------
+# Pydantic モデル
+# ---------------------
+
+
+class ItemBase(BaseModel):
+    name: str
+    description: str | None = None
+
+
+class ItemCreate(ItemBase):
+    pass
+
+
+class Item(ItemBase):
+    id: str = Field(alias="_id")
+
+    class Config:
+        populate_by_name = True
+
+
+# ---------------------
+# FastAPI アプリ & DB接続
+# ---------------------
 
 app = FastAPI()
 
 
-# DBセッションをリクエストごとに生成/破棄する依存関数
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+@app.on_event("startup")
+async def startup_db_client():
+    mongo_url = os.getenv("MONGO_URL", "mongodb://mongo:27017")
+    app.mongodb_client = AsyncIOMotorClient(mongo_url)
+    app.mongodb = app.mongodb_client["testdb"]
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    app.mongodb_client.close()
 
 
 # ---------------------
@@ -24,49 +50,25 @@ def get_db():
 
 
 # Create
-@app.post("/items/", response_model=schemas.Item)
-def create_item(item: schemas.ItemCreate, db: Session = Depends(get_db)):
-    db_item = models.Item(name=item.name, description=item.description)
-    db.add(db_item)
-    db.commit()
-    db.refresh(db_item)
-    return db_item
+@app.post("/items/", response_model=Item)
+async def create_item(item: ItemCreate):
+    result = await app.mongodb["items"].insert_one(item.dict())
+    new_item = await app.mongodb["items"].find_one({"_id": result.inserted_id})
+    new_item["_id"] = str(new_item["_id"])  # ← ここで変換
+    return Item(**new_item)
 
 
 # Read all
-@app.get("/items/", response_model=list[schemas.Item])
-def read_items(db: Session = Depends(get_db)):
-    return db.query(models.Item).all()
+@app.get("/items/", response_model=list[Item])
+async def read_items():
+    items = await app.mongodb["items"].find().to_list(100)
+    for item in items:
+        item["_id"] = str(item["_id"])  # ← ここで変換
+    return [Item(**i) for i in items]
 
 
-# Read one
-@app.get("/items/{item_id}", response_model=schemas.Item)
-def read_item(item_id: int, db: Session = Depends(get_db)):
-    db_item = db.query(models.Item).filter(models.Item.id == item_id).first()
-    if db_item is None:
-        raise HTTPException(status_code=404, detail="Item not found")
-    return db_item
-
-
-# Update
-@app.put("/items/{item_id}", response_model=schemas.Item)
-def update_item(item_id: int, item: schemas.ItemCreate, db: Session = Depends(get_db)):
-    db_item = db.query(models.Item).filter(models.Item.id == item_id).first()
-    if db_item is None:
-        raise HTTPException(status_code=404, detail="Item not found")
-    db_item.name = item.name
-    db_item.description = item.description
-    db.commit()
-    db.refresh(db_item)
-    return db_item
-
-
-# Delete
-@app.delete("/items/{item_id}")
-def delete_item(item_id: int, db: Session = Depends(get_db)):
-    db_item = db.query(models.Item).filter(models.Item.id == item_id).first()
-    if db_item is None:
-        raise HTTPException(status_code=404, detail="Item not found")
-    db.delete(db_item)
-    db.commit()
-    return {"ok": True}
+# Delete all
+@app.delete("/items/")
+async def delete_all_items():
+    delete_result = await app.mongodb["items"].delete_many({})
+    return {"deleted_count": delete_result.deleted_count}
